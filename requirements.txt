@@ -1,3 +1,5 @@
 fastapi
 numpy
 pandas
+soundfile
+scipy
