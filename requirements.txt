@@ -1,4 +1,3 @@
 fastapi
-httpx
-pandas
 numpy
+pandas
