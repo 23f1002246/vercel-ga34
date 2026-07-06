@@ -1,6 +1,6 @@
-import os, json, base64, io, re, httpx
-import pandas as pd
+import base64, io, wave
 import numpy as np
+import pandas as pd
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -13,19 +13,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-AIPIPE_TOKEN = os.environ.get("AIPIPE_TOKEN", "")
-
 class AudioRequest(BaseModel):
     audio_id: str
     audio_base64: str
 
-def compute_stats(df: pd.DataFrame) -> dict:
-    for col in df.columns:
-        try:
-            df[col] = pd.to_numeric(df[col])
-        except Exception:
-            pass
+def load_wav_samples(wav_bytes: bytes) -> np.ndarray:
+    """Load WAV audio and return samples as numpy array."""
+    with wave.open(io.BytesIO(wav_bytes)) as f:
+        n_channels = f.getnchannels()
+        sampwidth  = f.getsampwidth()   # bytes per sample
+        n_frames   = f.getnframes()
+        raw        = f.readframes(n_frames)
 
+    # Decode bytes to correct dtype
+    dtype_map = {1: np.uint8, 2: np.int16, 4: np.int32}
+    dtype = dtype_map.get(sampwidth, np.int16)
+    samples = np.frombuffer(raw, dtype=dtype)
+
+    # If stereo/multi-channel, use first channel
+    if n_channels > 1:
+        samples = samples.reshape(-1, n_channels)[:, 0]
+
+    return samples
+
+def compute_stats(df: pd.DataFrame) -> dict:
     numeric_cols   = df.select_dtypes(include=[np.number]).columns.tolist()
     categoric_cols = df.select_dtypes(exclude=[np.number]).columns.tolist()
 
@@ -49,12 +60,14 @@ def compute_stats(df: pd.DataFrame) -> dict:
         m = df[c].mode()
         mode[c] = safe(m.iloc[0]) if len(m) > 0 else None
 
-    allowed_values = {c: sorted([str(x) for x in df[c].dropna().unique().tolist()])
-                      for c in categoric_cols}
+    allowed_values = {
+        c: sorted([str(x) for x in df[c].dropna().unique().tolist()])
+        for c in categoric_cols
+    }
 
     if len(numeric_cols) >= 2:
-        corr_matrix = df[numeric_cols].corr().values.tolist()
-        correlation = [[safe(v) for v in row] for row in corr_matrix]
+        corr = df[numeric_cols].corr().values.tolist()
+        correlation = [[safe(v) for v in row] for row in corr]
     elif len(numeric_cols) == 1:
         correlation = [[1.0]]
     else:
@@ -69,143 +82,13 @@ def compute_stats(df: pd.DataFrame) -> dict:
         "value_range": val_range, "correlation": correlation
     }
 
-async def transcribe(audio_bytes: bytes) -> str:
-    """Transcribe Korean audio using Whisper."""
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(
-            "https://aipipe.org/openai/v1/audio/transcriptions",
-            headers={"Authorization": f"Bearer {AIPIPE_TOKEN}"},
-            files={
-                "file": ("audio.wav", audio_bytes, "audio/wav"),
-                "model": (None, "whisper-1"),
-                "language": (None, "ko"),
-                "response_format": (None, "text")
-            }
-        )
-        r.raise_for_status()
-        return r.text.strip()
-
 async def process(audio_id: str, audio_base64: str):
     audio_bytes = base64.b64decode(audio_base64)
 
-    # Strategy 1: raw bytes as CSV with Korean encoding
-    for encoding in ["utf-8", "cp949", "utf-16", "latin-1"]:
-        try:
-            text = audio_bytes.decode(encoding)
-            df = pd.read_csv(io.StringIO(text))
-            if len(df.columns) >= 1 and len(df) >= 1:
-                return compute_stats(df)
-        except Exception:
-            pass
-
-    # Strategy 2: raw JSON
-    try:
-        data = json.loads(audio_bytes.decode("utf-8"))
-        if isinstance(data, list):
-            df = pd.DataFrame(data)
-        elif isinstance(data, dict):
-            df = pd.DataFrame([data])
-        if len(df.columns) >= 1:
-            return compute_stats(df)
-    except Exception:
-        pass
-
-    # Strategy 3: Whisper → extract numbers → column "값"
-    # We now know the dataset has 1 column called "값" with numeric values
-    try:
-        transcription = await transcribe(audio_bytes)
-
-        if transcription:
-            # Try parsing as CSV first (maybe it's already formatted)
-            try:
-                df = pd.read_csv(io.StringIO(transcription))
-                if len(df.columns) >= 1 and len(df) >= 1:
-                    return compute_stats(df)
-            except Exception:
-                pass
-
-            # Extract all numbers from the transcription
-            # Korean audio likely reads out numbers for column "값"
-            numbers = re.findall(r'-?\d+(?:\.\d+)?', transcription)
-            if numbers:
-                values = [float(n) if '.' in n else int(n) for n in numbers]
-                df = pd.DataFrame({"값": values})
-                return compute_stats(df)
-
-            # Ask GPT to extract numbers from Korean text
-            async with httpx.AsyncClient(timeout=30) as client:
-                r2 = await client.post(
-                    "https://aipipe.org/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {AIPIPE_TOKEN}"},
-                    json={
-                        "model": "gpt-4o-mini",
-                        "messages": [
-                            {"role": "system",
-                             "content": (
-                                 "Extract ALL numeric values from the Korean text. "
-                                 "Return ONLY a CSV with header '값' and one number per row. "
-                                 "Example:\n값\n10\n20\n30\n"
-                                 "No explanation, no markdown."
-                             )},
-                            {"role": "user", "content": transcription}
-                        ],
-                        "max_tokens": 1000,
-                        "temperature": 0
-                    }
-                )
-                r2.raise_for_status()
-                csv_text = r2.json()["choices"][0]["message"]["content"].strip()
-                csv_text = csv_text.replace("```csv","").replace("```","").strip()
-                df = pd.read_csv(io.StringIO(csv_text))
-                if len(df.columns) >= 1 and len(df) >= 1:
-                    return compute_stats(df)
-    except Exception:
-        pass
-
-    # Strategy 4: gpt-4o-audio-preview direct audio → CSV with "값" column
-    try:
-        async with httpx.AsyncClient(timeout=90) as client:
-            r3 = await client.post(
-                "https://aipipe.org/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {AIPIPE_TOKEN}"},
-                json={
-                    "model": "gpt-4o-audio-preview",
-                    "messages": [{
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "input_audio",
-                                "input_audio": {"data": audio_base64, "format": "wav"}
-                            },
-                            {
-                                "type": "text",
-                                "text": (
-                                    "This Korean audio reads out numeric values. "
-                                    "Extract all numbers and return ONLY a CSV with header '값' "
-                                    "and one number per row. No explanation.\n"
-                                    "Example:\n값\n10\n25\n30"
-                                )
-                            }
-                        ]
-                    }],
-                    "max_tokens": 1000,
-                    "temperature": 0
-                }
-            )
-            r3.raise_for_status()
-            csv_text = r3.json()["choices"][0]["message"]["content"].strip()
-            csv_text = csv_text.replace("```csv","").replace("```","").strip()
-            df = pd.read_csv(io.StringIO(csv_text))
-            return compute_stats(df)
-    except Exception:
-        pass
-
-    # Safe fallback
-    return {
-        "rows": 0, "columns": [], "mean": {}, "std": {}, "variance": {},
-        "min": {}, "max": {}, "median": {}, "mode": {}, "range": {},
-        "allowed_values": {}, "value_range": {}, "correlation": []
-    }
+    # Load WAV samples and create DataFrame with column "값" (Korean: "value")
+    samples = load_wav_samples(audio_bytes)
+    df = pd.DataFrame({"값": samples})
+    return compute_stats(df)
 
 @app.post("/")
 async def root_post(body: AudioRequest):
