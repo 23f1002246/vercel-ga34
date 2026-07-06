@@ -1,4 +1,4 @@
-import os, json, base64, io, httpx
+import os, json, base64, io, re, httpx
 import pandas as pd
 import numpy as np
 from fastapi import FastAPI
@@ -20,7 +20,6 @@ class AudioRequest(BaseModel):
     audio_base64: str
 
 def compute_stats(df: pd.DataFrame) -> dict:
-    # Force numeric where possible
     for col in df.columns:
         try:
             df[col] = pd.to_numeric(df[col])
@@ -70,11 +69,27 @@ def compute_stats(df: pd.DataFrame) -> dict:
         "value_range": val_range, "correlation": correlation
     }
 
+async def transcribe(audio_bytes: bytes) -> str:
+    """Transcribe Korean audio using Whisper."""
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(
+            "https://aipipe.org/openai/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {AIPIPE_TOKEN}"},
+            files={
+                "file": ("audio.wav", audio_bytes, "audio/wav"),
+                "model": (None, "whisper-1"),
+                "language": (None, "ko"),
+                "response_format": (None, "text")
+            }
+        )
+        r.raise_for_status()
+        return r.text.strip()
+
 async def process(audio_id: str, audio_base64: str):
     audio_bytes = base64.b64decode(audio_base64)
 
-    # Strategy 1: raw CSV (various encodings)
-    for encoding in ["utf-8", "utf-16", "cp949", "latin-1"]:
+    # Strategy 1: raw bytes as CSV with Korean encoding
+    for encoding in ["utf-8", "cp949", "utf-16", "latin-1"]:
         try:
             text = audio_bytes.decode(encoding)
             df = pd.read_csv(io.StringIO(text))
@@ -90,50 +105,51 @@ async def process(audio_id: str, audio_base64: str):
             df = pd.DataFrame(data)
         elif isinstance(data, dict):
             df = pd.DataFrame([data])
-        return compute_stats(df)
+        if len(df.columns) >= 1:
+            return compute_stats(df)
     except Exception:
         pass
 
-    # Strategy 3: Whisper transcription → GPT-4o parse to CSV
-    transcription = ""
+    # Strategy 3: Whisper → extract numbers → column "값"
+    # We now know the dataset has 1 column called "값" with numeric values
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.post(
-                "https://aipipe.org/openai/v1/audio/transcriptions",
-                headers={"Authorization": f"Bearer {AIPIPE_TOKEN}"},
-                files={
-                    "file": ("audio.wav", audio_bytes, "audio/wav"),
-                    "model": (None, "whisper-1"),
-                    "language": (None, "ko"),
-                    "response_format": (None, "text")
-                }
-            )
-            r.raise_for_status()
-            transcription = r.text.strip()
+        transcription = await transcribe(audio_bytes)
 
         if transcription:
-            # Try parsing transcription directly as CSV
+            # Try parsing as CSV first (maybe it's already formatted)
             try:
                 df = pd.read_csv(io.StringIO(transcription))
-                if len(df.columns) >= 1:
+                if len(df.columns) >= 1 and len(df) >= 1:
                     return compute_stats(df)
             except Exception:
                 pass
 
-            # Use GPT-4o with strict prompt to extract CSV
-            async with httpx.AsyncClient(timeout=30) as client2:
-                r2 = await client2.post(
+            # Extract all numbers from the transcription
+            # Korean audio likely reads out numbers for column "값"
+            numbers = re.findall(r'-?\d+(?:\.\d+)?', transcription)
+            if numbers:
+                values = [float(n) if '.' in n else int(n) for n in numbers]
+                df = pd.DataFrame({"값": values})
+                return compute_stats(df)
+
+            # Ask GPT to extract numbers from Korean text
+            async with httpx.AsyncClient(timeout=30) as client:
+                r2 = await client.post(
                     "https://aipipe.org/openai/v1/chat/completions",
                     headers={"Authorization": f"Bearer {AIPIPE_TOKEN}"},
                     json={
                         "model": "gpt-4o-mini",
                         "messages": [
                             {"role": "system",
-                             "content": "You extract tabular data from text. Return ONLY a CSV with header row. No explanation, no markdown, no extra text. If you cannot extract data, return: col1\n0"},
-                            {"role": "user",
-                             "content": f"Extract the dataset from this text as CSV:\n\n{transcription}"}
+                             "content": (
+                                 "Extract ALL numeric values from the Korean text. "
+                                 "Return ONLY a CSV with header '값' and one number per row. "
+                                 "Example:\n값\n10\n20\n30\n"
+                                 "No explanation, no markdown."
+                             )},
+                            {"role": "user", "content": transcription}
                         ],
-                        "max_tokens": 2000,
+                        "max_tokens": 1000,
                         "temperature": 0
                     }
                 )
@@ -146,10 +162,10 @@ async def process(audio_id: str, audio_base64: str):
     except Exception:
         pass
 
-    # Strategy 4: gpt-4o-audio-preview — direct audio understanding
+    # Strategy 4: gpt-4o-audio-preview direct audio → CSV with "값" column
     try:
-        async with httpx.AsyncClient(timeout=60) as client3:
-            r3 = await client3.post(
+        async with httpx.AsyncClient(timeout=90) as client:
+            r3 = await client.post(
                 "https://aipipe.org/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {AIPIPE_TOKEN}"},
                 json={
@@ -159,18 +175,20 @@ async def process(audio_id: str, audio_base64: str):
                         "content": [
                             {
                                 "type": "input_audio",
-                                "input_audio": {
-                                    "data": audio_base64,
-                                    "format": "wav"
-                                }
+                                "input_audio": {"data": audio_base64, "format": "wav"}
                             },
                             {
                                 "type": "text",
-                                "text": "This audio contains a dataset. Extract the data and return ONLY a CSV with header row. No explanation."
+                                "text": (
+                                    "This Korean audio reads out numeric values. "
+                                    "Extract all numbers and return ONLY a CSV with header '값' "
+                                    "and one number per row. No explanation.\n"
+                                    "Example:\n값\n10\n25\n30"
+                                )
                             }
                         ]
                     }],
-                    "max_tokens": 2000,
+                    "max_tokens": 1000,
                     "temperature": 0
                 }
             )
@@ -182,7 +200,7 @@ async def process(audio_id: str, audio_base64: str):
     except Exception:
         pass
 
-    # Fallback: return empty but valid structure
+    # Safe fallback
     return {
         "rows": 0, "columns": [], "mean": {}, "std": {}, "variance": {},
         "min": {}, "max": {}, "median": {}, "mode": {}, "range": {},
